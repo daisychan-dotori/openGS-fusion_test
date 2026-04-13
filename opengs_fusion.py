@@ -77,7 +77,7 @@ class OpenGS_Fusion(SLAMParameters):
         self.downsample_idxs, self.x_pre, self.y_pre = self.set_downsample_filter(self.downsample_rate)
 
         # VDB Fusion parameters
-        self.max_points = 300000
+        self.max_points = 3000000
         self.max_label = 100
         self.voxel_size = args.voxel_size
         self.sdf_trunc = args.sdf_trunc

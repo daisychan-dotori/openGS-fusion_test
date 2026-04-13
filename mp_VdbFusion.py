@@ -21,6 +21,7 @@
 # SOFTWARE.
 
 import os
+import logging
 import time
 from typing import Any, Optional, Tuple, Callable, overload
 
@@ -29,6 +30,9 @@ import torch
 import torch.multiprocessing as mp
 import open3d as o3d
 import sys
+
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
 
 # 获取current_dir，到submodules/vdbfusion/src/vdbfusion/pybind
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -113,22 +117,26 @@ class VdbFusion(SLAMParameters):
             self.tsdf = self._volume._tsdf
             self.weights = self._volume._weights
 
+        vdb_frame_count = 0
         while True:
             if self.end_of_dataset[0]:
-                print(f"Final Voxel Count: {self.get_voxel_count()}")
+                logger.info(f"VDB: end of dataset, final voxel count: {self.get_voxel_count()}")
                 break
 
             if self.new_points_ready_for_vdb[0]:
                 scan, pose, scan_label, label_feature = self.shared_new_points_for_vdb.get_values_from_tracker()
                 scan = scan.astype(np.float64)
                 pose = pose.astype(np.float64)
+                logger.debug(f"VDB frame {vdb_frame_count}: integrating {scan.shape[0]} points...")
                 self.integrate(scan, pose)
+                logger.debug(f"VDB frame {vdb_frame_count}: integrate done, writing back results")
                 self.shared_new_points_for_vdb.input_value_from_vdb(
                     torch.tensor(self.points_2_voxel_index[:scan.shape[0]]),
                     torch.tensor(self.points_2_voxel_tsdf[:scan.shape[0]]),
                     torch.tensor(self.points_2_voxel_weight[:scan.shape[0]])
                 )
                 self.new_points_ready_for_vdb[0] = 0
+                vdb_frame_count += 1
 
                 if scan_label is not None:
                     scan_label = torch.tensor(scan_label, dtype=torch.int32).cuda().contiguous()
@@ -265,11 +273,13 @@ class VdbFusion(SLAMParameters):
             assert extrinsic.shape in [(3,), (3, 1), (4, 4)], "origin/extrinsic must be a (3,) array or a (4,4) matrix"
 
             _points = vdbfusion_pybind._VectorEigen3d(points)
+            logger.debug(f"VDB integrate: {points.shape[0]} pts, voxel_count={self.get_voxel_count()}")
             if weighting_function is not None:
                 return self._volume._integrate(_points, extrinsic, weighting_function)
             if weight is not None:
                 return self._volume._integrate(_points, extrinsic, weight)
             self._volume._integrate(_points, extrinsic)
+            logger.debug(f"VDB integrate: C++ _integrate returned")
 
     @overload
     def update_tsdf(self, sdf: float, ijk: np.ndarray, weighting_function: Optional[Callable[[float], float]]) -> None: ...

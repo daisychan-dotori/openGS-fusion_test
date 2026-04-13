@@ -1,5 +1,6 @@
 import copy
 import os
+import logging
 import torch
 import torch.multiprocessing as mp
 import torch.multiprocessing
@@ -12,6 +13,9 @@ import pygicp
 import time
 from scipy.spatial.transform import Rotation
 import rerun as rr
+
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
 sys.path.append(os.path.dirname(__file__))
 from arguments import SLAMParameters
 from utils.traj_utils import TrajManager
@@ -201,6 +205,8 @@ class Tracker(SLAMParameters):
 
             # VDBFusion integration: transform to world coordinates
             world_points = (gt_pose[:3, :3] @ points.T).T + gt_pose[:3, 3]
+            if self.new_points_ready_for_vdb[0]:
+                logger.debug(f"Frame {ii}: waiting for VDB to finish...")
             while self.new_points_ready_for_vdb[0]:
                 time.sleep(1e-15)
             if if_motion_exceeded or ii == 0 or ii == self.num_images-1:
@@ -290,10 +296,10 @@ class Tracker(SLAMParameters):
                 input_filter = np.zeros(points.shape[0], dtype=np.int32)
                 input_filter[(trackable_filter)] = [range(1, num_trackable_points+1)]
                 self.reg.set_source_filter(num_trackable_points, input_filter)
+                self.reg.calculate_source_covariance()
 
-                # Use ground truth pose for initialization
+                # Use ground truth pose directly (GICP tracking disabled)
                 initial_pose = copy.deepcopy(gt_pose)
-                current_pose = self.reg.align(initial_pose)
                 current_pose = initial_pose
                 self.poses.append(current_pose)
 
@@ -340,17 +346,16 @@ class Tracker(SLAMParameters):
                 if_tracking_keyframe = False
                 distances = False
 
-                # Mapping keyframe selection
-                if (self.from_last_tracking_keyframe) % self.keyframe_freq == 0:
-                    if_mapping_keyframe = True
-                else:
-                    if_mapping_keyframe = False
+                # Mapping keyframe selection — every frame is a keyframe
+                if_mapping_keyframe = True
 
                 if self.saving_all_keyframe and if_mapping_keyframe == False:
                     if_simple_saving_keyframe = True
 
                 # Tracking keyframe update
                 if if_tracking_keyframe:
+                    if self.is_tracking_keyframe_shared[0] or self.is_mapping_keyframe_shared[0]:
+                        logger.debug(f"Frame {ii}: tracking KF waiting for Mapper to consume previous KF...")
                     while self.is_tracking_keyframe_shared[0] or self.is_mapping_keyframe_shared[0]:
                         time.sleep(1e-15)
 
@@ -367,6 +372,8 @@ class Tracker(SLAMParameters):
                     not_overlapped_indices_of_trackable_points = self.eliminate_overlapped2(distances, self.overlapped_th2)
                     trackable_filter = trackable_filter[not_overlapped_indices_of_trackable_points]
 
+                    if self.new_points_ready_for_vdb[0]:
+                        logger.debug(f"Frame {ii}: tracking KF waiting for VDB...")
                     while self.new_points_ready_for_vdb[0]:
                         time.sleep(1e-15)
                     voxel_index, voxel_tsdf, voxel_weights = self.shared_new_points_for_vdb.get_value_from_vdb()
@@ -382,6 +389,8 @@ class Tracker(SLAMParameters):
 
                     self.is_tracking_keyframe_shared[0] = 1
 
+                    if not self.target_gaussians_ready[0]:
+                        logger.debug(f"Frame {ii}: tracking KF waiting for Mapper target gaussians...")
                     while not self.target_gaussians_ready[0]:
                         time.sleep(1e-15)
                     target_points, target_rots, target_scales = self.shared_target_gaussians.get_values_np()
@@ -395,6 +404,8 @@ class Tracker(SLAMParameters):
 
                 # Mapping keyframe update
                 elif if_mapping_keyframe:
+                    if self.is_tracking_keyframe_shared[0] or self.is_mapping_keyframe_shared[0]:
+                        logger.debug(f"Frame {ii}: mapping KF waiting for Mapper to consume previous KF...")
                     while self.is_tracking_keyframe_shared[0] or self.is_mapping_keyframe_shared[0]:
                         time.sleep(1e-15)
 
@@ -408,6 +419,8 @@ class Tracker(SLAMParameters):
                     scales = np.array(self.reg.get_source_scales())
                     scales = np.reshape(scales, (-1,3))
 
+                    if self.new_points_ready_for_vdb[0]:
+                        logger.debug(f"Frame {ii}: mapping KF waiting for VDB...")
                     while self.new_points_ready_for_vdb[0]:
                         time.sleep(1e-15)
                     voxel_index, voxel_tsdf, voxel_weights = self.shared_new_points_for_vdb.get_value_from_vdb()
@@ -440,6 +453,8 @@ class Tracker(SLAMParameters):
 
                 # Simple keyframe saving
                 elif if_simple_saving_keyframe:
+                    if self.is_simple_saving_keyframe_shared[0]:
+                        logger.debug(f"Frame {ii}: simple saving KF waiting for Mapper...")
                     while self.is_simple_saving_keyframe_shared[0]:
                         time.sleep(1e-15)
 

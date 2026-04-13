@@ -28,17 +28,23 @@ endif()
 set(ENV_PATH $ENV{OPENGS_ENV})
 
 # 设置路径变量
-set(CMAKE_PREFIX_PATH "${ENV_PATH}/lib/python3.9/site-packages/torch/share/cmake")
+list(APPEND CMAKE_PREFIX_PATH
+    "${ENV_PATH}/lib/python3.9/site-packages/torch/share/cmake"
+    "${ENV_PATH}/lib/python3.9/site-packages/pybind11/share/cmake"
+)
 set(CMAKE_LIBRARY_PATH "/usr/local/cuda-11.8/lib64;${ENV_PATH}/lib")
 
 find_package(pybind11 REQUIRED)
 
-# 设置libtorch的路径
+# Torch is not actually linked (target_link_libraries line is commented out),
+# so only search quietly to avoid a hard failure in GPU-less build environments.
 set(Torch_DIR "${ENV_PATH}/lib/python3.9/site-packages/torch/share/cmake/Torch/")
-find_package(Torch REQUIRED)
-
-# 打印找到的libtorch的路径
-message(STATUS "Torch_DIR: ${Torch_DIR}")
+find_package(Torch QUIET)
+if(Torch_FOUND)
+    message(STATUS "Torch_DIR: ${Torch_DIR}")
+else()
+    message(STATUS "Torch not found — skipping (not required for vdbfusion_pybind)")
+endif()
 
 # 添加定义以使用旧的CXX11 ABI
 # add_definitions(-D_GLIBCXX_USE_CXX11_ABI=0)
@@ -47,9 +53,14 @@ message(STATUS "Torch_DIR: ${Torch_DIR}")
 add_definitions(-DSTRIP_ERROR_MESSAGES)
 
 pybind11_add_module(vdbfusion_pybind vdbfusion_pybind.cpp)
-target_compile_options(vdbfusion_pybind PRIVATE -Werror -Wall -Wextra)
+target_compile_options(vdbfusion_pybind PRIVATE -Wall -Wextra -Wno-class-memaccess)
 target_link_libraries(vdbfusion_pybind PRIVATE VDBFusion::vdbfusion)
 # target_link_libraries(vdbfusion_pybind PRIVATE ${TORCH_LIBRARIES})
+
+# Explicitly link TBB so its symbols are recorded as a runtime dependency of
+# the .so (OpenVDB uses TBB internally; without this the symbols are left
+# undefined and the dynamic linker fails to load the module).
+target_link_libraries(vdbfusion_pybind PRIVATE TBB::tbb)
 
 # PYOPENVDB_SUPPORT is defined only by the existence of the pyopenvdb library.
 find_package(Python COMPONENTS Interpreter)

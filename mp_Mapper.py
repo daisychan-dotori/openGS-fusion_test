@@ -81,7 +81,7 @@ class Mapper(SLAMParameters):
         self.from_last_tracking_keyframe = 0
         self.from_last_mapping_keyframe = 0
         self.scene_extent = 2.5
-        self.prune_th = 2.5 if self.trajmanager.which_dataset == "replica" else 5.0
+        self.prune_th = 2.5
 
         self.downsample_idxs, self.x_pre, self.y_pre = self.set_downsample_filter(self.downsample_rate)
 
@@ -110,9 +110,41 @@ class Mapper(SLAMParameters):
         self.demo = slam.demo
         self.is_mapping_process_started = slam.is_mapping_process_started
 
+    ITERATIONS_PER_FRAME = 5
+
     def run(self):
         """Entry point for the mapping process."""
         self.mapping()
+
+    def _train_one_step(self, viewpoint_cam):
+        """Single optimization step on a given camera viewpoint."""
+        gt_image = viewpoint_cam.original_image.cuda()
+        gt_depth_image = viewpoint_cam.original_depth_image.cuda()
+
+        self.training = True
+        render_pkg = render_3(viewpoint_cam, self.gaussians, self.pipe, self.background, training_stage=0)
+        image = render_pkg["render"]
+        depth_image = render_pkg["render_depth"]
+
+        mask = (gt_depth_image > 0.).detach()
+        gt_image = gt_image * mask
+
+        Ll1_map, Ll1 = l1_loss(image, gt_image)
+        L_ssim_map, L_ssim = ssim(image, gt_image)
+        d_max = 10.
+        Ll1_d_map, Ll1_d = l1_loss(depth_image / d_max, gt_depth_image / d_max)
+        loss_rgb = (1.0 - self.lambda_dssim) * Ll1 + self.lambda_dssim * (1.0 - L_ssim)
+        loss = loss_rgb + 0.1 * Ll1_d
+
+        loss.backward()
+        with torch.no_grad():
+            if self.train_iter % 200 == 0:
+                self.gaussians.prune_large_and_transparent(0.005, self.prune_th)
+            self.gaussians.optimizer.step()
+            self.gaussians.optimizer.zero_grad(set_to_none=True)
+
+        self.training = False
+        self.train_iter += 1
 
     def mapping(self):
         """Main mapping loop. Receives new frames, updates map, and trains the model."""
@@ -155,9 +187,11 @@ class Mapper(SLAMParameters):
         newcam.on_cuda()
         self.mapping_cams.append(newcam)
         self.keyframe_idxs.append(newcam.cam_idx[0])
-        self.new_keyframes.append(len(self.mapping_cams) - 1)
 
-        new_keyframe = False
+        # Train on the first frame
+        for _ in range(self.ITERATIONS_PER_FRAME):
+            self._train_one_step(self.mapping_cams[0])
+
         while True:
             if self.end_of_dataset[0]:
                 break
@@ -165,7 +199,7 @@ class Mapper(SLAMParameters):
             if self.verbose:
                 self.run_viewer()
 
-            # Handle new tracking keyframe
+            # Handle new tracking keyframe (first frame only)
             if self.is_tracking_keyframe_shared[0]:
                 points, colors, rots, scales, z_values, trackable_filter, voxel_index = self.shared_new_gaussians.get_values()
                 self.gaussians.add_from_pcd2_tensor(points, colors, rots, scales, z_values, trackable_filter, voxel_index)
@@ -177,10 +211,16 @@ class Mapper(SLAMParameters):
                 newcam.on_cuda()
                 self.mapping_cams.append(newcam)
                 self.keyframe_idxs.append(newcam.cam_idx[0])
-                self.new_keyframes.append(len(self.mapping_cams) - 1)
                 self.is_tracking_keyframe_shared[0] = 0
 
-            # Handle new mapping keyframe
+                new_cam_idx = len(self.mapping_cams) - 1
+                for _ in range(self.ITERATIONS_PER_FRAME):
+                    self._train_one_step(self.mapping_cams[new_cam_idx])
+                    if len(self.mapping_cams) > 1:
+                        rand_idx = random.choice(range(new_cam_idx))
+                        self._train_one_step(self.mapping_cams[rand_idx])
+
+            # Handle new mapping keyframe (every subsequent frame)
             elif self.is_mapping_keyframe_shared[0]:
                 points, colors, rots, scales, z_values, _, voxel_index = self.shared_new_gaussians.get_values()
                 self.gaussians.add_from_pcd2_tensor(points, colors, rots, scales, z_values, [], voxel_index)
@@ -189,94 +229,14 @@ class Mapper(SLAMParameters):
                 newcam.on_cuda()
                 self.mapping_cams.append(newcam)
                 self.keyframe_idxs.append(newcam.cam_idx[0])
-                self.new_keyframes.append(len(self.mapping_cams) - 1)
                 self.is_mapping_keyframe_shared[0] = 0
 
-                # Save all keyframes if enabled
-                if self.saving_all_keyframe:
-                    self.simple_saving_cams.append(newcam)
-                    with torch.no_grad():
-                        render_pkg = render(newcam, self.gaussians, self.pipe, self.background)
-                        image = render_pkg["render"]
-                        image = image.cpu().numpy().transpose(1, 2, 0)
-                        image = np.clip(image, 0., 1.0) * 255
-                        image = image.astype(np.uint8)
-                        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-                    cv2.imwrite(f"{self.out_online_frame_path}/{newcam.cam_idx[0]}.png", image)
-
-            # Handle simple saving keyframe
-            elif self.is_simple_saving_keyframe_shared[0]:
-                newcam = copy.deepcopy(self.shared_cam)
-                newcam.on_cuda()
-                with torch.no_grad():
-                    render_pkg = render(newcam, self.gaussians, self.pipe, self.background)
-                    image = render_pkg["render"]
-                    image = image.cpu().numpy().transpose(1, 2, 0)
-                    image = np.clip(image, 0., 1.0) * 255
-                    image = image.astype(np.uint8)
-                    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-                    newcam.on_cpu()
-                    self.simple_saving_cams.append(newcam)
-                cv2.imwrite(f"{self.out_online_frame_path}/{newcam.cam_idx[0]}.png", image)
-                self.is_simple_saving_keyframe_shared[0] = 0
-
-            # Training step
-            if len(self.mapping_cams) > 0:
-                if len(self.new_keyframes) > 0:
-                    train_idx = self.new_keyframes.pop(0)
-                    viewpoint_cam = self.mapping_cams[train_idx]
-                    new_keyframe = True
-                else:
-                    train_idx = random.choice(range(len(self.mapping_cams)))
-                    viewpoint_cam = self.mapping_cams[train_idx]
-
-                # Select ground truth image and depth based on training stage
-                if self.training_stage == 0:
-                    gt_image = viewpoint_cam.original_image.cuda()
-                    gt_depth_image = viewpoint_cam.original_depth_image.cuda()
-                elif self.training_stage == 1:
-                    gt_image = viewpoint_cam.rgb_level_1.cuda()
-                    gt_depth_image = viewpoint_cam.depth_level_1.cuda()
-                elif self.training_stage == 2:
-                    gt_image = viewpoint_cam.rgb_level_2.cuda()
-                    gt_depth_image = viewpoint_cam.depth_level_2.cuda()
-
-                self.training = True
-                render_pkg = render_3(viewpoint_cam, self.gaussians, self.pipe, self.background, training_stage=self.training_stage)
-                depth_image = render_pkg["render_depth"]
-                image = render_pkg["render"]
-                viewspace_point_tensor, visibility_filter, radii = render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-
-                mask = (gt_depth_image > 0.).detach()
-                gt_image = gt_image * mask
-
-                # Loss calculation
-                Ll1_map, Ll1 = l1_loss(image, gt_image)
-                L_ssim_map, L_ssim = ssim(image, gt_image)
-                d_max = 10.
-                Ll1_d_map, Ll1_d = l1_loss(depth_image / d_max, gt_depth_image / d_max)
-                loss_rgb = (1.0 - self.lambda_dssim) * Ll1 + self.lambda_dssim * (1.0 - L_ssim)
-                loss_d = Ll1_d
-                loss = loss_rgb + 0.1 * loss_d
-
-                loss.backward()
-                with torch.no_grad():
-                    if self.train_iter % 200 == 0:
-                        self.gaussians.prune_large_and_transparent(0.005, self.prune_th)
-                    self.gaussians.optimizer.step()
-                    self.gaussians.optimizer.zero_grad(set_to_none=True)
-
-                    # Send rendered image to rerun viewer if new keyframe
-                    if new_keyframe and self.rerun_viewer:
-                        current_i = copy.deepcopy(self.iter_shared[0])
-                        rgb_np = image.cpu().numpy().transpose(1, 2, 0)
-                        rgb_np = np.clip(rgb_np, 0., 1.0) * 255
-                        rr.set_time_seconds("log_time", time.time() - self.total_start_time_viewer)
-                        rr.log("rendered_rgb", rr.Image(rgb_np))
-                        new_keyframe = False
-
-                self.training = False
-                self.train_iter += 1
+                new_cam_idx = len(self.mapping_cams) - 1
+                for _ in range(self.ITERATIONS_PER_FRAME):
+                    self._train_one_step(self.mapping_cams[new_cam_idx])
+                    if len(self.mapping_cams) > 1:
+                        rand_idx = random.choice(range(new_cam_idx))
+                        self._train_one_step(self.mapping_cams[rand_idx])
 
         # If verbose, keep viewer running
         if self.verbose:
@@ -422,13 +382,21 @@ class Mapper(SLAMParameters):
                 depth_error = depth_error.mean()
                 depth_l1.append(depth_error.detach().cpu() * 100)
 
-                os.makedirs(os.path.join(self.output_path, "rendered_images"), exist_ok=True)
-                if self.save_results and ((i + 1) % 100 == 0 or i == len(image_names) - 1):
-                    ours_rgb = np.asarray(saveed_rgb_.detach().cpu()).squeeze().transpose((1, 2, 0))
-                    ours_rgb = np.clip(ours_rgb, 0., 1.0) * 255
-                    ours_rgb = ours_rgb.astype(np.uint8)
-                    ours_rgb = cv2.cvtColor(ours_rgb, cv2.COLOR_BGR2RGB)
-                    cv2.imwrite(f"{self.output_path}/rendered_images/{i}.png", ours_rgb)
+                # Save side-by-side comparison (rendered vs ground truth) for every frame
+                vis_dir = os.path.join(self.output_path, "vis")
+                os.makedirs(vis_dir, exist_ok=True)
+
+                ours_rgb = np.asarray(saveed_rgb_.detach().cpu()).squeeze().transpose((1, 2, 0))
+                ours_rgb = np.clip(ours_rgb, 0., 1.0) * 255
+                ours_rgb = ours_rgb.astype(np.uint8)
+                ours_rgb = cv2.cvtColor(ours_rgb, cv2.COLOR_BGR2RGB)
+
+                gt_rgb_vis = np.clip(gt_rgb, 0., 1.0) * 255
+                gt_rgb_vis = gt_rgb_vis.astype(np.uint8)
+                gt_rgb_vis = cv2.cvtColor(gt_rgb_vis, cv2.COLOR_BGR2RGB)
+
+                comparison = np.concatenate([gt_rgb_vis, ours_rgb], axis=1)
+                cv2.imwrite(f"{vis_dir}/{i:04d}_gt_vs_render.png", comparison)
 
                 torch.cuda.empty_cache()
 
@@ -437,8 +405,18 @@ class Mapper(SLAMParameters):
             lpips = np.array(lpips)
             depth_l1 = np.array(depth_l1)
 
+            # Write per-frame PSNR to txt
+            psnr_path = os.path.join(self.output_path, "vis", "psnr_per_frame.txt")
+            with open(psnr_path, "w") as f:
+                f.write("frame\tpsnr\n")
+                for i, p in enumerate(psnrs):
+                    f.write(f"{i}\t{p:.4f}\n")
+                f.write(f"\nmean\t{psnrs.mean():.4f}\n")
+
             print(f"PSNR: {psnrs.mean():.2f}\nSSIM: {ssims.mean():.3f}\nLPIPS: {lpips.mean():.3f}")
             print(f"Depth_L1: {depth_l1.mean():.3f}")
+            print(f"Per-frame PSNR saved to {psnr_path}")
+            print(f"Comparisons saved to {vis_dir}/")
 
 def mse2psnr(x):
     """Convert MSE to PSNR."""

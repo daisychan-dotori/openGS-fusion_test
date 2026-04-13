@@ -53,7 +53,28 @@ if(USE_SYSTEM_OPENVDB)
   # When OpenVDB is available on the system, we just go for the dynamic version of it
   include(GNUInstallDirs)
   list(APPEND CMAKE_MODULE_PATH "${CMAKE_INSTALL_FULL_LIBDIR}/cmake/OpenVDB")
+  # Also try multiarch paths (Ubuntu/Debian x86_64)
+  list(APPEND CMAKE_MODULE_PATH "/usr/lib/x86_64-linux-gnu/cmake/OpenVDB")
   find_package(OpenVDB QUIET)
+  # Ubuntu 22.04's libopenvdb-dev (8.1) ships no cmake config.
+  # When the library + headers are present we create the imported target ourselves.
+  if(NOT OpenVDB_FOUND)
+    find_path(_OPENVDB_INC openvdb/openvdb.h)
+    find_library(_OPENVDB_LIB NAMES openvdb)
+    if(_OPENVDB_INC AND _OPENVDB_LIB)
+      message(STATUS "System OpenVDB found manually: ${_OPENVDB_LIB}")
+      add_library(OpenVDB::openvdb SHARED IMPORTED)
+      set_target_properties(OpenVDB::openvdb PROPERTIES
+        IMPORTED_LOCATION "${_OPENVDB_LIB}"
+        INTERFACE_INCLUDE_DIRECTORIES "${_OPENVDB_INC}")
+      find_package(TBB QUIET)
+      if(TBB_FOUND)
+        set_property(TARGET OpenVDB::openvdb APPEND PROPERTY
+          INTERFACE_LINK_LIBRARIES TBB::tbb)
+      endif()
+      set(OpenVDB_FOUND TRUE)
+    endif()
+  endif()
   if(OpenVDB_FOUND AND OpenVDB_USES_BLOSC)
     # We need to get these hidden dependencies (if available) to static link them inside our library
     target_link_libraries(OpenVDB::openvdb INTERFACE Blosc::blosc)

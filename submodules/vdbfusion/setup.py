@@ -59,14 +59,9 @@ class CMakeBuild(build_ext):
             f"-DCMAKE_BUILD_TYPE={cfg}",  # not used on MSVC, but no harm
         ]
         
-        tbb_root = os.environ.get("OPENGS_ENV") or os.environ.get("TBB_ROOT")
-        if not tbb_root:
-            raise RuntimeError(
-                "TBB_ROOT environment variable is not set. "
-                "Please set either OPENGS_ENV or TBB_ROOT to point to your TBB installation.\n"
-                "Example: export OPENGS_ENV=/path/to/tbb"
-            )
-        cmake_args.append(f"-DTBB_ROOT={tbb_root}")
+        tbb_root = os.environ.get("TBB_ROOT") or os.environ.get("OPENGS_ENV")
+        if tbb_root:
+            cmake_args.append(f"-DTBB_ROOT={tbb_root}")
 
         build_args = []
 
