@@ -90,6 +90,7 @@ class Mapper(SLAMParameters):
         self.bg_color = [1, 1, 1] if self.white_background else [0, 0, 0]
         self.background = torch.tensor(self.bg_color, dtype=torch.float32, device="cuda")
         self.train_iter = 0
+        self.total_iterations = len(self.trajmanager.gt_poses) * self.ITERATIONS_PER_FRAME * 2
         self.mapping_cams = []
         self.simple_saving_cams = []
         self.mapping_losses = []
@@ -140,6 +141,8 @@ class Mapper(SLAMParameters):
         with torch.no_grad():
             if self.train_iter % 200 == 0:
                 self.gaussians.prune_large_and_transparent(0.005, self.prune_th)
+            if self.train_iter % 3000 == 0 and self.train_iter > 500 and self.train_iter <= self.total_iterations * 0.9:
+                self.gaussians.reset_opacity()
             self.gaussians.optimizer.step()
             self.gaussians.optimizer.zero_grad(set_to_none=True)
 
@@ -237,6 +240,7 @@ class Mapper(SLAMParameters):
                     if len(self.mapping_cams) > 1:
                         rand_idx = random.choice(range(new_cam_idx))
                         self._train_one_step(self.mapping_cams[rand_idx])
+                print(f"[Mapper] frame {newcam.cam_idx[0]}: trained {self.ITERATIONS_PER_FRAME} iters, total_train_iter={self.train_iter}, num_gaussians={self.gaussians.get_xyz.shape[0]}", flush=True)
 
         # If verbose, keep viewer running
         if self.verbose:
